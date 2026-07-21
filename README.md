@@ -1,10 +1,4 @@
-# Bootstrapped Exploration with Causal Reasoning
-
-<p align="center">
-  <strong>A Training Paradigm for Adaptive Forecasting Agent</strong>
-  <br>
-  <strong>BECRA</strong>
-</p>
+# Bootstrapped Exploration with Causal Reasoning: A Training Paradigm for Adaptive Forecasting Agent (BECRA)
 
 <p align="center">
   <a href="https://openreview.net/forum?id=8d2LLxwU1r">
