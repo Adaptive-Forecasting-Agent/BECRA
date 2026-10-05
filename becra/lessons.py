@@ -39,134 +39,6 @@ class Lesson:
         return d
 
 
-SEED_VERIFIED_LESSONS: list[Lesson] = [
-    Lesson(
-        lesson_id="L_toolchain_linear_iqr_classical_timemixer_nonstationary",
-        lesson_type="positive",
-        toolchain="linear_iqr_none_classical_standard_timemixer",
-        task_category="Forecasting",
-        activation_conditions={"seasonality_level": ["moderate", "strong"], "trend_level": ["moderate", "strong"]},
-        phenomenon=(
-            "[Phenomenon]: TimeMixer belongs to the Forecasting tool category. When a dataset exhibits "
-            "clear seasonal or multi-scale trend structure, TimeMixer-style multi-scale mixing is often competitive."
-        ),
-        analysis=(
-            "[Analysis]: TimeMixer explicitly mixes temporal information across down-sampled scales. This inductive "
-            "bias is useful when the forecast target contains interacting short-term and long-term components."
-        ),
-        confidence=0.82,
-        tags=["multiscale", "seasonal", "nonstationary"],
-    ),
-    Lesson(
-        lesson_id="L_toolchain_linear_patchtst_clean_periodic",
-        lesson_type="positive",
-        toolchain="linear_none_none_none_standard_patchtst",
-        task_category="Forecasting",
-        activation_conditions={"seasonality_level": ["strong"], "missing_rate": "<0.1", "num_variates": "<64"},
-        phenomenon=(
-            "[Phenomenon]: PatchTST belongs to the Forecasting tool category. When missingness is low and periodic "
-            "structure is clear, patch-based attention can capture repeatable temporal motifs effectively."
-        ),
-        analysis=(
-            "[Analysis]: PatchTST tokenizes time into patches and applies channel-independent attention. It benefits "
-            "from clean local contexts and stable seasonal motifs, but this advantage weakens when cross-variate "
-            "dependencies dominate the task."
-        ),
-        confidence=0.78,
-        tags=["periodic", "low_missing", "channel_independent"],
-    ),
-    Lesson(
-        lesson_id="L_toolchain_linear_iqr_itransformer_high_dimensional",
-        lesson_type="positive",
-        toolchain="linear_iqr_none_none_standard_itransformer",
-        task_category="Forecasting",
-        activation_conditions={"num_variates": ">=64", "mean_abs_correlation": ">=0.05"},
-        phenomenon=(
-            "[Phenomenon]: iTransformer belongs to the Forecasting tool category. On high-dimensional multivariate "
-            "datasets with non-trivial cross-series correlation, inverted attention is a strong candidate."
-        ),
-        analysis=(
-            "[Analysis]: iTransformer treats variates as tokens and models dependencies along the feature dimension. "
-            "This mechanism aligns with datasets such as Electricity where many client series share correlated demand patterns."
-        ),
-        confidence=0.8,
-        tags=["high_dimensional", "cross_variate", "multivariate"],
-    ),
-    Lesson(
-        lesson_id="L_toolchain_linear_zscore_timesnet_multiperiod",
-        lesson_type="positive",
-        toolchain="linear_zscore_none_none_standard_timesnet",
-        task_category="Forecasting",
-        activation_conditions={"series_length": ">=10000", "seasonality_level": ["moderate", "strong"], "missing_pattern": ["none", "block-wise", "mixed"]},
-        phenomenon=(
-            "[Phenomenon]: TimesNet belongs to the Forecasting tool category. When a dataset has sufficient contiguous "
-            "samples and multiple periodic patterns, TimesNet can exploit 2D temporal variation."
-        ),
-        analysis=(
-            "[Analysis]: TimesNet reshapes one-dimensional temporal variation into period-aware two-dimensional "
-            "representations. It needs enough valid slices for training; heavily dispersed point-wise missingness can destroy these slices."
-        ),
-        confidence=0.72,
-        tags=["multiperiod", "sufficient_samples", "neural"],
-    ),
-    Lesson(
-        lesson_id="L_toolchain_linear_classical_dlinear_stable",
-        lesson_type="positive",
-        toolchain="linear_none_none_classical_standard_dlinear",
-        task_category="Forecasting",
-        activation_conditions={"trend_level": ["weak", "moderate"], "seasonality_level": ["weak", "moderate"], "volatility_level": ["low", "medium"]},
-        phenomenon=(
-            "[Phenomenon]: DLinear belongs to the Forecasting tool category. On smooth, low-complexity series, a "
-            "linear decomposition baseline can be robust and efficient."
-        ),
-        analysis=(
-            "[Analysis]: DLinear separates trend and seasonal components with a simple moving-average decomposition. "
-            "This low-variance inductive bias can outperform heavier neural models when the series is not strongly nonlinear."
-        ),
-        confidence=0.66,
-        tags=["simple", "linear", "stable"],
-    ),
-    Lesson(
-        lesson_id="L_impute_linear_pointwise",
-        lesson_type="positive",
-        toolchain="linear_none_none_none_standard_patchtst",
-        task_category="Imputation",
-        activation_conditions={"missing_pattern": ["point-wise dispersed"], "missing_rate": "<0.2"},
-        phenomenon=(
-            "[Phenomenon]: Linear Interpolation belongs to the Imputation tool category. When the dataset exhibits "
-            "point-wise missing data, local context is preserved and interpolation tends to be reliable."
-        ),
-        analysis=(
-            "[Analysis]: Linear Interpolation is non-parametric and uses neighboring observations. It is not limited "
-            "by training sample construction, so it is appropriate for sparse point-wise gaps before forecasting."
-        ),
-        confidence=0.84,
-        tags=["imputation", "pointwise_missing"],
-    ),
-    Lesson(
-        lesson_id="L_avoid_universal_decomposition",
-        lesson_type="negative",
-        toolchain="linear_iqr_none_classical_standard_timemixer",
-        task_category="Decomposition",
-        activation_conditions={"seasonality_level": ["weak"], "trend_level": ["weak"], "volatility_level": ["low"]},
-        phenomenon=(
-            "[Phenomenon]: Generic decomposition is not universally beneficial. On datasets without clear trend or "
-            "periodicity, decomposition can inject unnecessary processing noise."
-        ),
-        analysis=(
-            "[Analysis]: Decomposition helps only when separable trend or seasonal components exist. If the signal lacks "
-            "stable periodicity, forcing decomposition can produce residuals that are not easier to forecast."
-        ),
-        confidence=0.7,
-        tags=["negative", "decomposition", "avoid_overgeneralization"],
-    ),
-]
-
-
-def seed_lessons_as_dicts() -> list[dict[str, Any]]:
-    return [lesson.to_dict() for lesson in SEED_VERIFIED_LESSONS]
-
-
 def read_lessons(path: str | Path) -> list[Lesson]:
     payload = json.loads(Path(path).read_text())
     return [_lesson_from_dict(item) for item in payload]
@@ -209,17 +81,9 @@ def merge_lesson_collections(*collections: Iterable[Lesson | dict[str, Any]], de
     return list(by_key.values())
 
 
-def load_lessons_with_seed(
-    paths: Iterable[str | Path] | None = None,
-    include_seed: bool = True,
-) -> list[Lesson]:
-    """Load lessons from one or more JSON files and (optionally) prepend the seed lessons.
-
-    Later files override earlier ones on lesson_id collision; the seed lessons act as the lowest-priority base.
-    """
+def load_lessons(paths: Iterable[str | Path] | None = None) -> list[Lesson]:
+    """Load lessons from one or more JSON files; later files override earlier ones on lesson_id."""
     collections: list[list[Lesson]] = []
-    if include_seed:
-        collections.append(list(SEED_VERIFIED_LESSONS))
     for path in paths or []:
         p = Path(path)
         if not p.exists():
@@ -535,70 +399,6 @@ def apply_strategy_activation_for_planning(
     return out
 
 
-def rewiden_strategy_lessons_from_explore(
-    lessons: list[Lesson],
-    explore_csv: str | Path,
-    source_datasets: list[str],
-    *,
-    threshold_quantile: float = 0.5,
-) -> list[Lesson]:
-    """Re-widen strategy-lesson activation from explore positive runs (hold-out planning)."""
-    from .induction import dataset_meta_map, load_result_rows
-
-    path = Path(explore_csv)
-    if not path.is_file():
-        return lessons
-    rows = load_result_rows(path)
-    meta_by_ds = dataset_meta_map(source_datasets)
-    by_toolchain: dict[str, list[dict[str, Any]]] = {}
-
-    for toolchain in {lesson.toolchain for lesson in lessons if _is_strategy_lesson(lesson)}:
-        subset = [
-            r
-            for r in rows
-            if r["toolchain"] == toolchain and r["dataset"] in meta_by_ds
-        ]
-        if len(subset) < 2:
-            continue
-        rewards = [float(r["reward"]) for r in subset]
-        import numpy as np
-
-        threshold = float(np.quantile(rewards, threshold_quantile))
-        pos_rows = [r for r in subset if float(r["reward"]) >= threshold]
-        if not pos_rows:
-            continue
-        by_toolchain[toolchain] = [meta_by_ds[r["dataset"]] for r in pos_rows]
-
-    out: list[Lesson] = []
-    for lesson in lessons:
-        if not _is_strategy_lesson(lesson) or lesson.toolchain not in by_toolchain:
-            out.append(lesson)
-            continue
-        if evidence_toolchain_preprocessing_depth(lesson.toolchain) == 0:
-            # Plain baseline strategies already deploy via stage lessons; widening
-            # their activation makes them match every hold-out meta profile.
-            out.append(lesson)
-            continue
-        patched = Lesson(
-            lesson_id=lesson.lesson_id,
-            lesson_type=lesson.lesson_type,
-            toolchain=lesson.toolchain,
-            task_category=lesson.task_category,
-            activation_conditions=widen_strategy_activation(
-                lesson.activation_conditions,
-                by_toolchain[lesson.toolchain],
-            ),
-            phenomenon=lesson.phenomenon,
-            analysis=lesson.analysis,
-            confidence=lesson.confidence,
-            tags=list(lesson.tags or []) + ["strategy_activation_widened"],
-            tool=lesson.tool,
-            evidence_pred_len=lesson.evidence_pred_len,
-        )
-        out.append(patched)
-    return out
-
-
 def cap_activation_conditions(conditions: dict[str, Any], max_keys: int = 2) -> dict[str, Any]:
     """Keep at most ``max_keys`` meta-feature keys (excluding pred_len, added separately)."""
     cond = normalize_activation_conditions(dict(conditions))
@@ -672,22 +472,42 @@ def _is_strategy_lesson(lesson: Lesson) -> bool:
     return "strategy_level" in tags
 
 
+def _vacuous_strategy_activation(lesson: Lesson) -> bool:
+    """True when a Strategy lesson's categorical rules cover every ordinal level (no info)."""
+    if not _is_strategy_lesson(lesson):
+        return False
+    cond = lesson.activation_conditions or {}
+    for key, levels in _CATEGORICAL_ORDINAL.items():
+        rule = cond.get(key)
+        if isinstance(rule, (list, tuple, set)) and set(map(str, rule)) >= set(levels):
+            return True
+    return False
+
+
 def _planning_rank_key(
     lesson: Lesson,
     overlap: int,
     strict: bool,
-) -> tuple[int, int, float, float, int, str]:
-    """Alg. 4 retrieval order: strict > overlap > verified effect > confidence > strategy.
+) -> tuple[int, int, float, int, float, int, str]:
+    """Alg. 4 retrieval order: strict > overlap > verified effect > parsimony > confidence.
 
-    Verified causal effect outranks lesson granularity: a stage-level lesson whose
-    evidence strategy repeatedly won paired rollouts is stronger retrieval evidence
-    than a strategy-level lesson with weak verification."""
+    Verified causal effect still dominates. When effects are equal/absent (e.g. plan
+    before verify, or tied verify), prefer shallower evidence toolchains so induce
+    noise + deep-preprocess confidence cannot crowd out plain baselines. Chain
+    parsimony is a documented Alg. 4 fuzzy-area tie-break (no dataset hardcoding).
+    Vacuous all-level Strategy activations do not receive the strategy bonus.
+    """
+    vacuous = _vacuous_strategy_activation(lesson)
+    strategy_bonus = int(_is_strategy_lesson(lesson) and not vacuous)
     return (
         int(strict),
         overlap,
         float(lesson.verification_effect or 0.0),
+        -evidence_toolchain_preprocessing_depth(lesson.toolchain),
+        # Vacuous all-level Strategy lessons sort below concrete stage lessons.
+        -int(vacuous),
         float(lesson.confidence),
-        int(_is_strategy_lesson(lesson)),
+        strategy_bonus,
         lesson.lesson_id,
     )
 
@@ -712,8 +532,24 @@ def rank_lessons_by_meta_overlap(
     return scored
 
 
+def _toolchain_has_mechanism_match(matched: list[Lesson], toolchain: str) -> bool:
+    """True if toolchain has a strict-matched Forecasting or non-vacuous Strategy lesson."""
+    for lesson in matched:
+        if lesson.toolchain != toolchain:
+            continue
+        if lesson.task_category == "Forecasting":
+            return True
+        if _is_strategy_lesson(lesson) and not _vacuous_strategy_activation(lesson):
+            return True
+    return False
+
+
 def _top_k_toolchain_diverse(matched: list[Lesson], top_k: int) -> list[Lesson]:
-    """Cap prompt size while keeping at least one lesson per evidence toolchain slug."""
+    """Cap prompt size while keeping at least one lesson per evidence toolchain slug.
+
+    Prefer toolchains with Forecasting / non-vacuous Strategy support so a
+    Normalization-only match cannot nominate a forecast model by itself.
+    """
     if top_k <= 0 or len(matched) <= top_k:
         return list(matched)
     buckets: dict[str, list[Lesson]] = {}
@@ -724,17 +560,27 @@ def _top_k_toolchain_diverse(matched: list[Lesson], top_k: int) -> list[Lesson]:
             buckets[tc] = []
             toolchain_order.append(tc)
         buckets[tc].append(lesson)
+
+    primary_order = [tc for tc in toolchain_order if _toolchain_has_mechanism_match(matched, tc)]
+    fallback_order = [tc for tc in toolchain_order if tc not in primary_order]
+
     selected: list[Lesson] = []
-    while len(selected) < top_k:
-        added = False
-        for tc in toolchain_order:
-            if buckets[tc]:
-                selected.append(buckets[tc].pop(0))
-                added = True
-                if len(selected) >= top_k:
-                    break
-        if not added:
-            break
+
+    def _fill(order: list[str]) -> None:
+        while len(selected) < top_k:
+            added = False
+            for tc in order:
+                if buckets.get(tc):
+                    selected.append(buckets[tc].pop(0))
+                    added = True
+                    if len(selected) >= top_k:
+                        return
+            if not added:
+                return
+
+    _fill(primary_order)
+    if len(selected) < top_k:
+        _fill(fallback_order)
     return selected
 
 
@@ -841,26 +687,6 @@ def primary_evidence_toolchain(
     return ranked_primary
 
 
-def top_k_lessons_for_planning(
-    lesson_pool: Iterable[Lesson],
-    meta: dict[str, Any],
-    pred_len: int,
-    k: int,
-    *,
-    min_overlap: int = 0,
-) -> list[Lesson]:
-    """Return the top ``k`` lessons by meta-feature overlap (optionally require min overlap)."""
-    if k <= 0:
-        return []
-    ranked = rank_lessons_by_meta_overlap(lesson_pool, meta, pred_len)
-    filtered = [
-        (lesson, overlap, strict)
-        for lesson, overlap, strict in ranked
-        if strict or overlap >= max(0, int(min_overlap))
-    ]
-    return [lesson for lesson, _, _ in filtered[:k]]
-
-
 def lessons_for_paper_planning(
     lesson_pool: Iterable[Lesson],
     meta: dict[str, Any],
@@ -904,25 +730,6 @@ def lessons_for_paper_planning(
         else:
             llm_pool = list(focused or matched)
     return llm_pool, matched
-
-
-def lessons_for_target_planning(
-    lesson_pool: Iterable[Lesson],
-    meta: dict[str, Any],
-    pred_len: int,
-    *,
-    top_k: int = 5,
-    min_overlap: int = 1,
-) -> tuple[list[Lesson], list[Lesson]]:
-    """Legacy/champion mode: loose overlap matching (strict OR overlap >= min_overlap)."""
-    ranked = rank_lessons_by_meta_overlap(lesson_pool, meta, pred_len)
-    scoring = [
-        lesson
-        for lesson, overlap, strict in ranked
-        if strict or overlap >= max(1, int(min_overlap))
-    ]
-    llm_pool = scoring[:top_k] if top_k > 0 else list(scoring)
-    return llm_pool, scoring
 
 
 def lesson_matches_for_planning(

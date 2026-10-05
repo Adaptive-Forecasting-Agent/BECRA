@@ -30,7 +30,7 @@ echo "Archiving previous Weather hold-out outputs (if any)..."
 for f in \
   weather_explore_results.csv weather_explore_results.ucb.json weather_explore_log.jsonl \
   weather_candidate_lessons.json weather_verified_lessons.json weather_paired_rollout_cache.json \
-  weather_zeroshot.csv weather_zeroshot_mechanism_test.csv weather_verified_mechanism_test.json; do
+  weather_zeroshot.csv; do
   archive_if_exists "$OUT/$f"
 done
 if [[ -d "$OUT/weather_lesson_induction_prompts" ]]; then
@@ -96,20 +96,16 @@ stage explore "${PY[@]}" explore \
   --log-path "$OUT/weather_explore_log.jsonl"
 
 stage induce "${PY[@]}" induce \
-  --use-llm --no-heuristic --overwrite \
+  --overwrite \
   --datasets "${SRC_DATASETS[@]}" \
   --results-csv "$OUT/weather_explore_results.csv" \
   --prompt-dir "$OUT/weather_lesson_induction_prompts" \
   --llm-raw-dir "$OUT/weather_lesson_induction_llm_raw" \
   --lesson-json "$OUT/weather_candidate_lessons.json" \
   --threshold-quantile 0.5 \
-  --induction-mode paper \
   --max-induction-groups 25 --max-lessons-per-group 7
 
 stage verify "${PY[@]}" verify \
-  --paired-rollout --rollout-mode execute \
-  --verify-planner llm \
-  --no-seed \
   --datasets "${SRC_DATASETS[@]}" \
   --pred-lens 96 192 336 720 \
   "${GPU_ARGS[@]}" \
@@ -121,12 +117,9 @@ stage verify "${PY[@]}" verify \
   --top-alpha 0.35 --min-effect 0.0 --min-verify-support 2 --target-verify-datasets 3
 
 stage run "${PY[@]}" run \
-  --planner llm \
   --datasets Weather \
   --pred-lens 96 192 336 720 \
   "${GPU_ARGS[@]}" \
-  --no-seed \
-  --planning-mode paper \
   --planning-inject-scope matched \
   --planning-top-k 8 \
   --planning-llm-retries 3 \

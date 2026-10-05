@@ -20,7 +20,7 @@ BECRA is an agent training paradigm for adaptive time-series forecasting. Instea
 Real-world time series are heterogeneous: they differ in volatility, seasonality, missingness, anomaly patterns, cross-variate structure, and distribution shift. No single forecasting model or preprocessing chain is universally optimal. BECRA treats forecasting as an **agent decision problem**: given dataset meta-features, the agent composes a multi-stage toolchain across imputation, anomaly handling, transformation, decomposition, normalization, and forecasting, while accumulating transferable knowledge that can be verified, stored, retrieved, and reused at deployment time.
 
 <p align="center">
-  <img src="asset/framework_overview.jpg" alt="BECRA framework overview" width="92%">
+  <img src="asset/framework_overview.png" alt="BECRA framework overview" width="92%">
   <br>
   <em>Overview of the four-stage BECRA training and adaptation cycle.</em>
 </p>
@@ -38,6 +38,13 @@ Real-world time series are heterogeneous: they differ in volatility, seasonality
 ## Four-Stage Pipeline
 
 Following the paper, BECRA trains an adaptive forecasting agent through a four-stage cycle: it explores forecasting strategies, abstracts the observed contrasts into causal lessons, verifies those lessons through controlled policy interventions, and finally applies the validated lesson memory to unseen datasets through in-context planning.
+
+| Stage | CLI subcommand | Main code | Output |
+| --- | --- | --- | --- |
+| 1. Explore | `explore` | `becra/ucb.py`, `becra/runner.py` | `<holdout>_explore_results.csv` |
+| 2. Induce | `induce` | `becra/induction.py`, `becra/prompt_templates.py` | `<holdout>_candidate_lessons.json` |
+| 3. Verify | `verify` | `becra/induction.py` | `<holdout>_verified_lessons.json` |
+| 4. Run | `run` | `becra/planner.py`, `becra/lessons.py` | `<holdout>_zeroshot.csv` |
 
 ### 1. Exploratory Construction of Forecasting Strategies
 
@@ -76,7 +83,7 @@ If you run GPU experiments, install a PyTorch build compatible with your CUDA ve
 
 ## LLM Configuration
 
-Paper-style runs in Stages 2-4 use an OpenAI-compatible LLM endpoint for lesson induction, verification-time planning, and lesson-guided target planning. Set these variables before launching the holdout scripts:
+Stages 2-4 use an OpenAI-compatible LLM endpoint for lesson induction, verification-time planning, and lesson-guided target planning. Set these variables before launching the holdout scripts:
 
 ```bash
 export BECRA_LLM_BASE_URL="https://your-endpoint/v1"
@@ -84,7 +91,7 @@ export BECRA_LLM_API_KEY="your_api_key"
 export BECRA_LLM_MODEL="your_model_name"
 ```
 
-Optional GPU assignment:
+Optional GPU assignment (default `0 1`):
 
 ```bash
 export BECRA_GPUS="0 1"
@@ -144,6 +151,8 @@ bash scripts/run_all_holdouts_sequential.sh --from electricity
 bash scripts/run_all_holdouts_sequential.sh --only ettm2
 ```
 
+In each holdout, the target dataset is never used in stages 1-3; lessons are learned on the other five datasets and transferred zero-shot in stage 4.
+
 ## Single-Holdout Runs
 
 Each script below executes `Explore -> Induce -> Verify -> Run` for one target dataset. Existing outputs for that target are archived before a fresh run starts.
@@ -163,19 +172,22 @@ Detached mode is available for long runs:
 bash scripts/run_weather_holdout_pipeline.sh --nohup
 ```
 
+Per-stage logs are written to `logs/<dataset>_holdout_<RUN_ID>/{explore,induce,verify,run}.log`, and results to `outputs/`.
+
 ## Low-Level CLI
 
-Advanced users can invoke individual stages through `scripts/run_becra_long_term.py`.
+Advanced users can invoke individual stages through `scripts/run_becra_long_term.py`. Example for the Weather holdout:
 
 ```bash
+SRC="ETTh1 ETTh2 ETTm1 ETTm2 Electricity"
 python scripts/run_becra_long_term.py profile --datasets Weather
-python scripts/run_becra_long_term.py explore --datasets ETTh1 ETTh2 ETTm1 ETTm2 Electricity --rounds 2
-python scripts/run_becra_long_term.py induce --datasets ETTh1 ETTh2 ETTm1 ETTm2 Electricity --use-llm
-python scripts/run_becra_long_term.py verify --datasets ETTh1 ETTh2 ETTm1 ETTm2 Electricity --paired-rollout
-python scripts/run_becra_long_term.py run --datasets Weather
+python scripts/run_becra_long_term.py explore --datasets $SRC --rounds 12 --results-csv outputs/weather_explore_results.csv
+python scripts/run_becra_long_term.py induce  --datasets $SRC --results-csv outputs/weather_explore_results.csv --lesson-json outputs/weather_candidate_lessons.json --overwrite
+python scripts/run_becra_long_term.py verify  --datasets $SRC --results-csv outputs/weather_explore_results.csv --lesson-json outputs/weather_candidate_lessons.json --verified-json outputs/weather_verified_lessons.json --overwrite
+python scripts/run_becra_long_term.py run     --datasets Weather --lessons-json outputs/weather_verified_lessons.json --results-csv outputs/weather_zeroshot.csv
 ```
 
-Use `--help` on any subcommand for the full set of stage-specific options.
+The holdout scripts contain the full hyperparameter settings for each stage. Use `--help` on any subcommand for the complete set of options.
 
 ## Citation
 
@@ -184,8 +196,9 @@ If BECRA is useful for your research, please cite:
 ```bibtex
 @inproceedings{zeng2026becra,
   title     = {Bootstrapped Exploration with Causal Reasoning: A Training Paradigm for Adaptive Forecasting Agent},
-  author    = {Qingwen Zeng and Dajun Guo and Zhaoge Bi and Lining Chen and Jushang Qiu and Yitian Yang and Carl Yang and Huaming Chen and Ling Chen},
-  booktitle = {Forty-third International Conference on Machine Learning},
-  year      = {2026}
+  author    = {Zeng, Qingwen and Guo, Dajun and Bi, Zhaoge and Chen, Lining and Qiu, Jushang and Yang, Yitian and Yang, Carl and Chen, Huaming and Chen, Ling},
+  booktitle = {Proceedings of the 43rd International Conference on Machine Learning},
+  year      = {2026},
+  url       = {https://proceedings.mlr.press/v306/zeng26e.html}
 }
 ```

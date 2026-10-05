@@ -6,7 +6,6 @@ from typing import Any
 from .config import TOOLCHAINS, ToolchainSpec, tool_library_as_dict
 from .lessons import (
     Lesson,
-    SEED_VERIFIED_LESSONS,
     condition_matches,
     effective_activation_conditions,
     lesson_matches,
@@ -73,6 +72,170 @@ def _resolve_planned_toolchain(response: dict[str, Any]) -> str | None:
     return spec.name if spec is not None else None
 
 
+def _preprocess_extras_unjustified(
+    meta: dict[str, Any],
+    shallow_name: str,
+    deep_name: str,
+) -> bool:
+    """True when deep adds preprocess stages that this dataset's meta does not support."""
+    if shallow_name not in TOOLCHAINS or deep_name not in TOOLCHAINS:
+        return False
+    s = TOOLCHAINS[shallow_name].stages
+    d = TOOLCHAINS[deep_name].stages
+    missing = float(meta.get("missing_rate") or 0.0)
+    anomaly_ratio = float(meta.get("anomaly_ratio") or 0.0)
+    seasonality = str(meta.get("seasonality_level") or "")
+    dominant = meta.get("dominant_period")
+
+    if s.get("imputation") in {None, "none"} and d.get("imputation") not in {None, "none"}:
+        if missing < 1e-6:
+            return True
+    if s.get("anomaly_handling") in {None, "none"} and d.get("anomaly_handling") not in {
+        None,
+        "none",
+    }:
+        # Low anomaly mass: prefer evidence that omits anomaly handling.
+        if anomaly_ratio < 0.05:
+            return True
+    if s.get("decomposition") in {None, "none"} and d.get("decomposition") not in {
+        None,
+        "none",
+    }:
+        # No clear period / weak seasonality: FFT/classical not meta-justified.
+        if dominant in {None, "", 0, 0.0} and seasonality in {"", "weak", "none"}:
+            return True
+    return False
+
+
+def _strict_forecasting_evidence(
+    lessons: list[Lesson],
+    meta: dict[str, Any],
+    pred_len: int,
+) -> list[str]:
+    """Evidence toolchains whose Forecasting lesson strictly activates for this meta."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for lesson in lessons:
+        if lesson.task_category != "Forecasting":
+            continue
+        name = lesson.toolchain
+        if not name or name not in TOOLCHAINS or name in seen:
+            continue
+        if lesson_matches(meta, lesson, pred_len):
+            names.append(name)
+            seen.add(name)
+    return names
+
+
+def _parsimony_snap_to_evidence(
+    resolved: str,
+    meta: dict[str, Any],
+    evidence_toolchains: list[str] | None,
+    *,
+    matched_lessons: list[Lesson] | None = None,
+) -> str:
+    """Remap LLM proposals toward shallow, mechanism-fitting retrieved evidence.
+
+    Paper Alg. 5 still plans over the full library; this only remaps when:
+    1) same forecasting model already appears in retrieved evidence with a shallower
+       preprocess, and the extra stages are not supported by this dataset's meta; or
+    2) some evidence toolchain has a *strictly matching* Forecasting lesson for this
+       meta, but the proposal does not — then prefer the shallowest such evidence
+       (prevents Normalization/Strategy-only or non-activating Forecasting support
+       from nominating a forecast model when a better-fitting one is available).
+    No dataset- or model-name hardcoding.
+    """
+    from .tools import evidence_toolchain_preprocessing_depth
+
+    if resolved not in TOOLCHAINS:
+        return resolved
+
+    snapped = resolved
+    evidence = [e for e in (evidence_toolchains or []) if e in TOOLCHAINS]
+    pred_len = int(meta.get("pred_len") or 0)
+
+    # (1) Same-model parsimony snap when unjustified preprocess depth is added.
+    if evidence:
+        model = TOOLCHAINS[resolved].forecasting
+        same_model = [e for e in evidence if TOOLCHAINS[e].forecasting == model]
+        if same_model:
+            missing = float(meta.get("missing_rate") or 0.0)
+            if missing < 1e-6:
+                no_imp = [
+                    e for e in same_model if TOOLCHAINS[e].imputation in {None, "none"}
+                ]
+                if no_imp:
+                    same_model = no_imp
+
+            pool = list(same_model)
+            if resolved in evidence and resolved not in pool:
+                pool.append(resolved)
+
+            def ok_candidate(name: str) -> bool:
+                if name == resolved:
+                    return True
+                return (
+                    evidence_toolchain_preprocessing_depth(name)
+                    < evidence_toolchain_preprocessing_depth(resolved)
+                    and _preprocess_extras_unjustified(meta, name, resolved)
+                ) or (
+                    resolved not in evidence
+                    and evidence_toolchain_preprocessing_depth(name)
+                    <= evidence_toolchain_preprocessing_depth(resolved)
+                )
+
+            candidates = [e for e in pool if ok_candidate(e)]
+            if not candidates:
+                candidates = list(same_model) if resolved not in evidence else [resolved]
+
+            candidate = min(
+                candidates,
+                key=lambda e: (evidence_toolchain_preprocessing_depth(e), e),
+            )
+            if candidate != snapped:
+                print(
+                    f"[paper-plan] parsimony-snap {snapped!r} -> {candidate!r} "
+                    f"(same forecasting model in retrieved evidence)"
+                )
+                snapped = candidate
+
+    # (2) Mechanism-fit snap: prefer evidence with strict Forecasting activation.
+    lessons = list(matched_lessons or [])
+    strict_fc = _strict_forecasting_evidence(lessons, meta, pred_len)
+    if strict_fc and snapped not in strict_fc:
+        best = min(
+            strict_fc,
+            key=lambda e: (evidence_toolchain_preprocessing_depth(e), e),
+        )
+        if best != snapped:
+            print(
+                f"[paper-plan] mechanism-snap {snapped!r} -> {best!r} "
+                f"(strict Forecasting evidence activates; proposal does not)"
+            )
+            snapped = best
+
+    # (3) Cross-model parsimony: if a shallower strict-Forecasting evidence chain
+    # exists and the proposal's extra preprocess stages are not meta-justified,
+    # snap to that shallow evidence (preprocess must earn its place).
+    if strict_fc:
+        best = min(
+            strict_fc,
+            key=lambda e: (evidence_toolchain_preprocessing_depth(e), e),
+        )
+        if (
+            best != snapped
+            and evidence_toolchain_preprocessing_depth(best)
+            < evidence_toolchain_preprocessing_depth(snapped)
+            and _preprocess_extras_unjustified(meta, best, snapped)
+        ):
+            print(
+                f"[paper-plan] parsimony-snap {snapped!r} -> {best!r} "
+                f"(shallower strict Forecasting evidence; extra preprocess unjustified)"
+            )
+            snapped = best
+    return snapped
+
+
 def paper_planning_context() -> dict[str, Any]:
     """Appendix Alg. 4: encode available toolchains A and executable stage tools."""
     return {
@@ -96,7 +259,11 @@ def _score_toolchain_by_lessons(
     *,
     toolchain_scope: bool = False,
 ) -> dict[str, tuple[float, list[Lesson]]]:
-    """Lesson-vote scoring only (paper deployment fallback; no meta heuristics)."""
+    """Lesson-vote scoring only (paper deployment fallback; no meta heuristics).
+
+    Uses mean confidence over supporting lessons so explore/induce frequency cannot
+    dominate (aligned with Alg. 4 prompt: do not prefer by lesson count).
+    """
     names = [n for n in candidate_names if n in TOOLCHAINS]
     if not names:
         return {}
@@ -110,7 +277,14 @@ def _score_toolchain_by_lessons(
                 continue
             scores[name] += delta
             matched[name].append(lesson)
-    return {name: (scores[name], matched[name]) for name in names}
+    out: dict[str, tuple[float, list[Lesson]]] = {}
+    for name in names:
+        support = matched[name]
+        if support:
+            out[name] = (scores[name] / len(support), support)
+        else:
+            out[name] = (scores[name], support)
+    return out
 
 
 def _score_toolchain_candidates(
@@ -118,7 +292,7 @@ def _score_toolchain_candidates(
     active_lessons: list[Lesson],
     candidate_names: set[str] | list[str],
 ) -> dict[str, tuple[float, list[Lesson]]]:
-    """Lesson votes + optional meta heuristics (legacy champion mode only)."""
+    """Lesson votes + optional meta heuristics."""
     names = [n for n in candidate_names if n in TOOLCHAINS]
     if not names:
         return {}
@@ -333,10 +507,25 @@ def paper_plan_toolchain(
                 client,
                 retries=llm_retries,
                 skip_meta_filter=True,
-                allowed_toolchains=None,
                 planning_context=ctx,
             )
             if pick is not None:
+                evidence_names = list(ctx.get("evidence_toolchains") or [])
+                snapped_name = _parsimony_snap_to_evidence(
+                    pick.toolchain.name,
+                    meta,
+                    evidence_names,
+                    # Use full strict-matched set (not only the top-k inject budget)
+                    # so mechanism-fit snap sees every activating Forecasting lesson.
+                    matched_lessons=matched,
+                )
+                if snapped_name != pick.toolchain.name and snapped_name in TOOLCHAINS:
+                    pick = PlanningResult(
+                        TOOLCHAINS[snapped_name],
+                        pick.score,
+                        pick.matched_lessons,
+                        f"{pick.reason}; evidence_snap->{snapped_name}",
+                    )
                 sample_picks.append(pick)
         llm_pick: PlanningResult | None = None
         if sample_picks:
@@ -344,9 +533,12 @@ def paper_plan_toolchain(
             for pick in sample_picks:
                 counts[pick.toolchain.name] = counts.get(pick.toolchain.name, 0) + 1
 
-            def _tiebreak(name: str) -> tuple[int, int]:
-                """When votes tie: prefer candidates that often won as control, then
-                prefer not adding imputation when missing_rate is exactly zero."""
+            def _tiebreak(name: str) -> tuple[int, int, int, int, int]:
+                """When votes tie: strict Forecasting activation, control winners,
+                avoid unjustified imputation, shallower preprocess, then any
+                Forecasting lesson (mechanism-level evidence beats normalization-only)."""
+                from .tools import evidence_toolchain_preprocessing_depth
+
                 verification = (
                     ctx.get("evidence_toolchain_verification", {})
                     if isinstance(ctx, dict)
@@ -360,13 +552,41 @@ def paper_plan_toolchain(
                     and stages.get("imputation") not in {None, "none"}
                 ):
                     unjustified_impute = 1
-                return (ctrl_wins, -unjustified_impute)
+                # Negated depth so shallower ranks higher under max().
+                shallow = -evidence_toolchain_preprocessing_depth(name)
+                strict_fc = int(
+                    any(
+                        lesson.toolchain == name
+                        and lesson.task_category == "Forecasting"
+                        and lesson_matches(meta, lesson, pred_len)
+                        for lesson in llm_lessons
+                    )
+                )
+                has_forecasting_lesson = int(
+                    any(
+                        lesson.toolchain == name and lesson.task_category == "Forecasting"
+                        for lesson in llm_lessons
+                    )
+                )
+                return (
+                    strict_fc,
+                    ctrl_wins,
+                    -unjustified_impute,
+                    shallow,
+                    has_forecasting_lesson,
+                )
 
+            best_votes = max(counts.values())
+            # Near-ties (within 1 vote): prioritize Alg. 4 parsimony / mechanism-fit
+            # tie-breaks over a single-sample vote gap.
+            contenders = [
+                name for name, votes in counts.items() if votes >= max(1, best_votes - 1)
+            ]
             modal_name = max(
-                counts,
+                contenders,
                 key=lambda name: (
-                    counts[name],
                     _tiebreak(name),
+                    counts[name],
                     -next(i for i, p in enumerate(sample_picks) if p.toolchain.name == name),
                 ),
             )
@@ -412,72 +632,6 @@ def paper_plan_toolchain(
     )
 
 
-def planning_context_for_champions(champion_names: list[str]) -> dict[str, Any]:
-    """Stage tool union and per-champion stage patterns for champion-pool-only LLM planning."""
-    imputation: set[str] = set()
-    anomaly: set[str] = set()
-    decomposition: set[str] = set()
-    forecasting: set[str] = set()
-    stages_by_champion: dict[str, dict[str, str]] = {}
-    for name in champion_names:
-        if name not in TOOLCHAINS:
-            continue
-        stages = TOOLCHAINS[name].stages
-        stages_by_champion[name] = stages
-        imputation.add(stages["imputation"])
-        anomaly.add(stages["anomaly_handling"])
-        decomposition.add(stages["decomposition"])
-        forecasting.add(stages["forecasting"])
-    return {
-        "champion_toolchains_only": list(champion_names),
-        "stages_by_champion": stages_by_champion,
-        "stage_tools": {
-            "imputation": sorted(imputation),
-            "anomaly_handling": sorted(anomaly),
-            "transformation": ["none"],
-            "decomposition": sorted(decomposition),
-            "normalization": ["standard_scaler"],
-            "forecasting": sorted(forecasting),
-        },
-    }
-
-
-def _pick_from_champion_pool(
-    meta: dict[str, Any],
-    score_lessons: list[Lesson],
-    champion_names: list[str],
-    *,
-    note: str,
-) -> PlanningResult:
-    scored = _score_toolchain_candidates(meta, score_lessons, set(champion_names))
-    selected_name = max(scored, key=lambda n: scored[n][0])
-    best_score, best_matched = scored[selected_name]
-    return PlanningResult(
-        TOOLCHAINS[selected_name],
-        best_score,
-        best_matched,
-        f"{note}; champion-pool fallback score={best_score:.2f}; picked={selected_name}",
-    )
-
-
-def meta_champion_toolchains(meta: dict[str, Any]) -> list[str]:
-    """Compact registry candidates for hold-out / champion selection (not lesson injection)."""
-    names = [
-        "none_none_none_none_standard_timexer",
-        "none_none_none_none_standard_multipatchformer",
-    ]
-    num_variates = float(meta.get("num_variates") or 1)
-    missing = float(meta.get("missing_rate") or 0.0)
-    seasonality = meta.get("seasonality_level")
-    if num_variates >= 64:
-        names.append("linear_iqr_none_fft_standard_itransformer")
-    if seasonality in {"moderate", "strong"}:
-        names.append("linear_zscore_none_fft_standard_timesnet")
-    if missing < 0.05 and seasonality in {"weak", "moderate"}:
-        names.append("linear_none_none_none_standard_patchtst")
-    return [n for n in names if n in TOOLCHAINS]
-
-
 def plan_toolchain(
     meta: dict[str, Any],
     lessons: list[Lesson] | None = None,
@@ -485,7 +639,7 @@ def plan_toolchain(
     relaxed_lesson_match: bool = False,
     skip_meta_filter: bool = False,
 ) -> PlanningResult:
-    lesson_pool = list(SEED_VERIFIED_LESSONS) if lessons is None else list(lessons)
+    lesson_pool = [] if lessons is None else list(lessons)
     if skip_meta_filter:
         active_lessons = list(lesson_pool)
     else:
@@ -500,127 +654,6 @@ def plan_toolchain(
     return PlanningResult(selected, best_score, best_matched, reason)
 
 
-def champion_plan_toolchain(
-    meta: dict[str, Any],
-    lesson_pool: list[Lesson],
-    client: Any | None = None,
-    *,
-    top_k: int = 5,
-    min_overlap: int = 1,
-    llm_retries: int = 3,
-    use_llm: bool = True,
-) -> PlanningResult:
-    """Stage-wise LLM planning with matched lessons; champion-pool-only when none match."""
-    from .lessons import lessons_for_target_planning
-
-    pred_len = int(meta["pred_len"])
-    champions = meta_champion_toolchains(meta)
-    llm_lessons, score_lessons = lessons_for_target_planning(
-        lesson_pool,
-        meta,
-        pred_len,
-        top_k=top_k,
-        min_overlap=min_overlap,
-    )
-    has_match = bool(score_lessons)
-    print(
-        f"[champion-plan] pl={pred_len} has_match={has_match} "
-        f"llm_lessons={len(llm_lessons)} score_lessons={len(score_lessons)}"
-    )
-
-    if use_llm and client is not None and getattr(client, "available", False):
-        if has_match and llm_lessons:
-            llm_pick = llm_plan_toolchain(
-                meta,
-                llm_lessons,
-                client,
-                retries=llm_retries,
-                skip_meta_filter=True,
-            )
-            if llm_pick is not None:
-                return PlanningResult(
-                    llm_pick.toolchain,
-                    0.0,
-                    llm_pick.matched_lessons,
-                    f"llm_stage_plan matched_lessons={len(llm_lessons)}; {llm_pick.reason}",
-                )
-            print("[champion-plan] LLM failed with matched lessons; fallback to champion pool")
-            return _pick_from_champion_pool(
-                meta,
-                score_lessons,
-                champions,
-                note="llm_failed_with_matched_lessons",
-            )
-
-        if not has_match:
-            champion_ctx = planning_context_for_champions(champions)
-            llm_pick = llm_plan_toolchain(
-                meta,
-                [],
-                client,
-                retries=llm_retries,
-                skip_meta_filter=True,
-                allowed_toolchains=frozenset(champions),
-                planning_context=champion_ctx,
-                champion_pool_only=True,
-            )
-            if llm_pick is not None:
-                return PlanningResult(
-                    llm_pick.toolchain,
-                    0.0,
-                    [],
-                    f"llm_stage_plan champion_pool_only; {llm_pick.reason}",
-                )
-            print("[champion-plan] LLM failed with no lesson match; fallback to champion pool scoring")
-            return _pick_from_champion_pool(
-                meta,
-                [],
-                champions,
-                note="llm_failed_no_lesson_match",
-            )
-
-    if has_match:
-        return _pick_from_champion_pool(
-            meta,
-            score_lessons,
-            champions,
-            note="llm_unavailable_with_matched_lessons",
-        )
-    return _pick_from_champion_pool(
-        meta,
-        [],
-        champions,
-        note="llm_unavailable_no_lesson_match",
-    )
-
-
-def rank_toolchains(meta: dict[str, Any], lessons: list[Lesson] | None = None) -> list[PlanningResult]:
-    primary = plan_toolchain(meta, lessons=lessons)
-    results = []
-    lesson_pool = list(SEED_VERIFIED_LESSONS) if lessons is None else list(lessons)
-    active = _filter_lessons_for_planning(lesson_pool, meta, for_verify=False)
-    for name in TOOLCHAINS:
-        cloned_meta = dict(meta)
-        chosen = TOOLCHAINS[name]
-        matched = [
-            lesson
-            for lesson in active
-            if (
-                (lesson.tool and name in toolchains_matching_tool(lesson.tool, lesson.task_category))
-                or lesson.toolchain == name
-            )
-        ]
-        score = sum((1.0 if lesson.lesson_type == "positive" else -0.7) * lesson.confidence for lesson in matched)
-        scores = {n: 0.0 for n in TOOLCHAINS}
-        _add_heuristic_scores(cloned_meta, scores)
-        score += scores[name]
-        results.append(PlanningResult(chosen, score, matched, _reason(cloned_meta, chosen, matched, score)))
-    results.sort(key=lambda item: item.score, reverse=True)
-    if results and results[0].toolchain.name != primary.toolchain.name:
-        results.insert(0, primary)
-    return results
-
-
 def llm_plan_toolchain(
     meta: dict[str, Any],
     lessons: list[Lesson] | None,
@@ -629,14 +662,12 @@ def llm_plan_toolchain(
     *,
     relaxed_lesson_match: bool = False,
     skip_meta_filter: bool = False,
-    allowed_toolchains: frozenset[str] | None = None,
     planning_context: dict[str, Any] | None = None,
-    champion_pool_only: bool = False,
 ) -> PlanningResult | None:
     """Stage 4: LLM picks one tool per stage, resolved to a registered toolchain."""
     if not getattr(client, "available", False):
         return None
-    lesson_pool = list(SEED_VERIFIED_LESSONS) if lessons is None else list(lessons)
+    lesson_pool = [] if lessons is None else list(lessons)
     if skip_meta_filter:
         matched = list(lesson_pool)
     else:
@@ -646,12 +677,7 @@ def llm_plan_toolchain(
     lesson_dicts = [lesson.to_dict() for lesson in matched]
     if planning_context is None:
         planning_context = paper_planning_context()
-    prompt = lesson_guided_planning_prompt(
-        meta,
-        lesson_dicts,
-        planning_context,
-        champion_pool_only=champion_pool_only,
-    )
+    prompt = lesson_guided_planning_prompt(meta, lesson_dicts, planning_context)
     last_err: Exception | None = None
     for _ in range(max(1, retries + 1)):
         try:
@@ -666,11 +692,6 @@ def llm_plan_toolchain(
             print(
                 f"[llm-planner] could not materialize stages (invalid combo or missing fields): "
                 f"{response.get('stages')!r}"
-            )
-            continue
-        if allowed_toolchains is not None and toolchain_name not in allowed_toolchains:
-            print(
-                f"[llm-planner] resolved {toolchain_name!r} not in allowed champion pool; retry"
             )
             continue
         matched_ids = set(response.get("matched_lessons") or [])

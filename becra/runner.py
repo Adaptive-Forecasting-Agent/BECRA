@@ -280,5 +280,3 @@ def run_forecast(
     return run
 
 
-def shell_command(command: list[str]) -> str:
-    return " ".join(shlex.quote(part) for part in command)

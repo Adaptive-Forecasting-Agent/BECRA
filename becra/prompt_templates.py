@@ -3,20 +3,19 @@ from __future__ import annotations
 import json
 from typing import Any
 
-
 _VERIFY_PLAN_LESSON_EXAMPLE = """  1. Lesson1: [Phenomenon] KNN belongs to the Imputation tool category. When the dataset has a low missing rate, such as missing_rate=0.06, KNN tends to support strong forecasting performance. [Analysis] KNN estimates missing values from similar neighboring samples. With low missingness, most local references remain valid, so imputation noise is limited.
   2. Lesson2: [Phenomenon] FFT belongs to the Decomposition tool category. When the dataset has a clear 24-hour seasonal peak, FFT tends to improve forecasting performance. [Analysis] FFT extracts dominant frequency components. A 24-hour seasonal peak indicates stable daily periodicity, allowing FFT to provide clearer seasonal signals for downstream forecasting."""
 
 
 def _format_meta_block(meta: dict[str, Any]) -> str:
-    """Compact meta line: {key=value, ...}."""
+    """Compact meta line like the paper examples: {key=value, ...}."""
     skip = {"dataset", "n_runs", "mean_reward"}
     parts = [f"{k}={meta[k]}" for k in sorted(meta) if k not in skip and meta.get(k) is not None]
     return "{" + ", ".join(parts) + "}"
 
 
 def _lessons_description(lessons: list[dict[str, Any]]) -> str:
-    """Format lessons for prompt injection."""
+    """Format lessons for {Lessons_description}; prefer tool + task_category phrasing."""
     lines: list[str] = []
     for idx, lesson in enumerate(lessons, start=1):
         phen = str(lesson.get("phenomenon") or "").strip()
@@ -314,118 +313,6 @@ Return JSON only:
 }}"""
 
 
-def lesson_induction_pair_prompt(
-    toolchain_name: str,
-    toolchain_stages: dict[str, str],
-    pred_len: int,
-    positive_case: dict[str, Any],
-    negative_case: dict[str, Any],
-    pair_index: int,
-) -> str:
-    pair_id = f"{toolchain_name}_pl{pred_len}_pair{pair_index}"
-    return f"""You are an expert in time-series forecasting, tool planning, and agent-level causal reasoning.
-
-BECRA induces **single-tool** causal lessons for Lesson-Guided Planning. Each lesson must attribute success or failure
-to ONE tool in ONE stage category (Imputation, Anomaly Handling, Transformation, Decomposition, Normalization, or Forecasting).
-The full six-stage evidence toolchain is context only — do NOT write phenomenon/analysis about the whole toolchain slug.
-
-Evidence toolchain (fixed context for this contrast):
-{toolchain_name}
-Stages: {json.dumps(toolchain_stages, indent=2, ensure_ascii=False)}
-
-Forecast horizon (fixed for this pair): pred_len = {pred_len}
-
-Positive case (same toolchain + pred_len, higher reward):
-{json.dumps(positive_case, indent=2, ensure_ascii=False)}
-
-Negative case (same toolchain + pred_len, lower reward):
-{json.dumps(negative_case, indent=2, ensure_ascii=False)}
-
-Write exactly ONE candidate lesson (a single object in the lessons array). Each lesson MUST:
-- Name exactly one `tool` from the stages above (e.g. TimeMixer, iqr, linear_interpolation, classical_decomposition).
-- Set `task_category` to that tool's stage (Forecasting, Imputation, Anomaly Handling, etc.).
-- Write `phenomenon` and `analysis` about that single tool's mechanism under the meta-feature difference between the two cases.
-- Be conditional (when to use / avoid), not universal.
-- Use activation_conditions checkable from meta-features.
-
-Good verified lesson style (single-tool):
-{json.dumps(VERIFIED_LESSON_EXAMPLES, indent=2, ensure_ascii=False)}
-
-Bad lessons:
-{json.dumps(FILTERED_LESSON_EXAMPLES, indent=2, ensure_ascii=False)}
-
-Return JSON only:
-{{
-  "lessons": [
-    {{
-      "lesson_id": "{pair_id}_L1",
-      "lesson_type": "positive|negative",
-      "tool": "exact_tool_name_from_stages",
-      "task_category": "Imputation|Anomaly Handling|Decomposition",
-      "evidence_toolchain": "{toolchain_name}",
-      "activation_conditions": {{
-        "feature_name": "operator and threshold or categorical value"
-      }},
-      "phenomenon": "[Phenomenon]: <Tool> belongs to the <task_category> tool category. When ...",
-      "analysis": "[Analysis]: mechanism for this tool only ...",
-      "confidence": 0.0,
-      "verification_notes": "what controlled intervention should test"
-    }}
-  ]
-}}"""
-
-
-def lesson_induction_prompt(
-    toolchain_name: str,
-    positive_meta: list[dict[str, Any]],
-    negative_meta: list[dict[str, Any]],
-    positive_scores: list[dict[str, Any]] | None = None,
-    negative_scores: list[dict[str, Any]] | None = None,
-    contrast_summary: dict[str, Any] | None = None,
-    toolchain_stages: dict[str, str] | None = None,
-    pred_len: int | None = None,
-) -> str:
-    """Legacy bulk prompt; prefer lesson_induction_pair_prompt for new runs."""
-    if pred_len is not None and len(positive_meta) == 1 and len(negative_meta) == 1:
-        return lesson_induction_pair_prompt(
-            toolchain_name,
-            toolchain_stages or {},
-            pred_len,
-            positive_meta[0],
-            negative_meta[0],
-            pair_index=0,
-        )
-    summary_block = ""
-    if contrast_summary:
-        summary_block = (
-            "\nContrastive meta-feature summary:\n"
-            f"{json.dumps(contrast_summary, indent=2, ensure_ascii=False)}\n"
-        )
-    stages_block = ""
-    if toolchain_stages:
-        stages_block = f"\nEvidence toolchain stages:\n{json.dumps(toolchain_stages, indent=2, ensure_ascii=False)}\n"
-    return f"""You are an expert in time-series forecasting, tool planning, and agent-level causal reasoning.
-
-Induce **single-tool** lessons (not whole-toolchain claims). Evidence toolchain: {toolchain_name}
-{stages_block}{summary_block}
-Positive outcomes:
-{json.dumps(positive_meta, indent=2, ensure_ascii=False)}
-
-Negative outcomes:
-{json.dumps(negative_meta, indent=2, ensure_ascii=False)}
-
-Return JSON with fields: lesson_id, lesson_type, tool, task_category, evidence_toolchain, activation_conditions, phenomenon, analysis, confidence.
-Each phenomenon/analysis must refer to one tool only.
-
-Good examples:
-{json.dumps(VERIFIED_LESSON_EXAMPLES, indent=2, ensure_ascii=False)}
-
-Bad examples:
-{json.dumps(FILTERED_LESSON_EXAMPLES, indent=2, ensure_ascii=False)}
-
-Return JSON only: {{ "lessons": [ ... ] }}"""
-
-
 def _lessons_description_with_evidence(lessons: list[dict[str, Any]]) -> str:
     """Paper planning prompt asks the LLM to weigh 'strongest verified causal effects';
     append each lesson's evidence toolchain and verification statistics so it can."""
@@ -479,50 +366,7 @@ def lesson_guided_planning_prompt(
     meta_features: dict[str, Any],
     lessons: list[dict[str, Any]],
     planning_context: Any,
-    *,
-    champion_pool_only: bool = False,
 ) -> str:
-    if champion_pool_only:
-        return f"""You are an expert in time series forecasting and tool planning.
-Your task is to plan the best forecasting strategy for the new dataset by meta features.
-
-You are given:
-- Meta features of the new dataset: {_format_meta_block(meta_features)}
-
-**No causal lessons matched** this meta-profile at this horizon. Do NOT invent lesson-based preprocessing claims.
-
-Plan a **six-stage** toolchain by choosing one executable tool per stage.
-Stages (in order): Imputation -> Anomaly Handling -> Transformation -> Decomposition -> Normalization -> Forecasting.
-
-Champion pool (the resolved toolchain name MUST be exactly one of these registered slugs):
-{json.dumps(planning_context.get("champion_toolchains_only", []), indent=2, ensure_ascii=False)}
-
-Reference stage patterns for each champion (pick stages that resolve to one slug above):
-{json.dumps(planning_context.get("stages_by_champion", {}), indent=2, ensure_ascii=False)}
-
-Allowed tools per stage (union over the champion pool only):
-{json.dumps(planning_context.get("stage_tools", {}), indent=2, ensure_ascii=False)}
-
-Planning requirements:
-1. Pick **one tool per stage** — do NOT return a toolchain slug directly in a single field; return a ``stages`` object.
-2. After stage choices are resolved, the toolchain must be **exactly one** name from the champion pool list.
-3. Prefer ``none`` for imputation, anomaly_handling, and decomposition when using TimeXer or MultiPatchFormer.
-4. Return concrete stage tools aligned with one champion pattern.
-
-Return JSON only:
-{{
-  "stages": {{
-    "imputation": "...",
-    "anomaly_handling": "...",
-    "transformation": "...",
-    "decomposition": "...",
-    "normalization": "...",
-    "forecasting": "..."
-  }},
-  "matched_lessons": [],
-  "reason": "[Phenomenon]: ... [Causal Analysis]: ..."
-}}"""
-
     lessons_block = (
         _lessons_description_with_evidence(lessons)
         if lessons

@@ -1,6 +1,6 @@
-# Conda env for BECRA (GPU training + LLM API for stages 2–4).
+# Conda environment for BECRA.
 # Create:  conda env create -f environment.yml
-# Or use scripts/activate_becra.sh after: conda create -n becra python=3.10 -y
+# Then install a PyTorch build that matches your CUDA version (https://pytorch.org).
 name: becra
 channels:
   - defaults
@@ -13,12 +13,10 @@ dependencies:
       - scipy>=1.10
       - scikit-learn>=1.3
       - statsmodels>=0.14
+      - EMD-signal>=1.5
       - einops>=0.7
       - requests>=2.31
       - PyYAML>=6.0
+      - matplotlib>=3.7
       - datasets>=2.18
       - huggingface_hub>=0.20
-      - matplotlib>=3.7
-# RTX 5090 (sm_120) needs cu128, not cu124:
-#   export TMPDIR=/home/user/tmp PIP_CACHE_DIR=/home/user/.pip-cache
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128

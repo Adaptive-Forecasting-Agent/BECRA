@@ -8,27 +8,21 @@ from typing import Any, Callable
 
 import numpy as np
 
-from .config import TOOLCHAINS, get_dataset, get_toolchain
+from .config import get_dataset, get_toolchain
 from .lessons import (
     Lesson,
-    SEED_VERIFIED_LESSONS,
     bind_pred_len_condition,
     cap_activation_conditions,
-    condition_matches,
     lesson_matches,
     merge_lesson_collections,
     meta_for_horizon,
     normalize_activation_conditions,
-    read_lessons,
-    write_lessons,
 )
 from .meta_features import compute_meta_features
-from .planner import _pick_by_lesson_votes, plan_toolchain
+from .planner import plan_toolchain
 from .prompt_templates import (
     lesson_induction_group_prompt,
-    lesson_induction_pair_prompt,
     lesson_induction_paper_prompt,
-    lesson_induction_prompt,
 )
 from .tools import (
     is_preprocessing_lesson,
@@ -39,7 +33,7 @@ from .tools import (
     toolchains_matching_tool,
 )
 from .runner import run_forecast
-from .ucb import reward_from_metrics
+from .ucb import forecasting_model_from_arm, preprocessing_depth_from_arm, reward_from_metrics
 
 
 def load_result_rows(path: Path) -> list[dict[str, Any]]:
@@ -69,92 +63,6 @@ def _dedupe_rows_by_dataset_pred_len(rows: list[dict[str, Any]]) -> list[dict[st
         if key not in best or row["reward"] > best[key]["reward"]:
             best[key] = row
     return list(best.values())
-
-
-def _all_contrast_pairs(
-    rows: list[dict[str, Any]],
-    dataset_names: list[str],
-    threshold_quantile: float = 0.5,
-) -> list[tuple[str, int, int, dict[str, Any], dict[str, Any], float]]:
-    meta_names = set(dataset_names)
-    pairs: list[tuple[str, int, int, dict[str, Any], dict[str, Any], float]] = []
-    for toolchain in sorted({row["toolchain"] for row in rows}):
-        subset = [
-            row for row in _dedupe_rows_by_dataset_pred_len(
-                [r for r in rows if r["toolchain"] == toolchain and r["dataset"] in meta_names]
-            )
-        ]
-        if len(subset) < 2:
-            continue
-        for pred_len in sorted({int(r["pred_len"]) for r in subset}):
-            pl_rows = [r for r in subset if int(r["pred_len"]) == pred_len]
-            if len(pl_rows) < 2:
-                continue
-            rewards = np.array([r["reward"] for r in pl_rows], dtype=float)
-            threshold = float(np.quantile(rewards, threshold_quantile))
-            pos = sorted([r for r in pl_rows if r["reward"] >= threshold], key=lambda r: -r["reward"])
-            neg = sorted([r for r in pl_rows if r["reward"] < threshold], key=lambda r: r["reward"])
-            if not pos or not neg:
-                continue
-            for pair_idx in range(min(len(pos), len(neg))):
-                gap = float(pos[pair_idx]["reward"]) - float(neg[pair_idx]["reward"])
-                pairs.append((toolchain, pred_len, pair_idx, pos[pair_idx], neg[pair_idx], gap))
-    return pairs
-
-
-def select_contrast_pairs(
-    rows: list[dict[str, Any]],
-    dataset_names: list[str],
-    threshold_quantile: float = 0.5,
-    max_total_pairs: int = 10,
-    max_pairs_per_toolchain: int = 2,
-    max_pairs_per_pred_len: int = 1,
-) -> list[tuple[str, int, int, dict[str, Any], dict[str, Any]]]:
-    """Pick strongest reward-gap contrasts under per-toolchain / global caps."""
-    raw = _all_contrast_pairs(rows, dataset_names, threshold_quantile)
-    if not raw:
-        return []
-    by_toolchain: dict[str, list[tuple[str, int, int, dict[str, Any], dict[str, Any], float]]] = {}
-    for item in raw:
-        by_toolchain.setdefault(item[0], []).append(item)
-
-    selected: list[tuple[str, int, int, dict[str, Any], dict[str, Any], float]] = []
-    for toolchain in sorted(by_toolchain):
-        tc_items = sorted(by_toolchain[toolchain], key=lambda x: -x[5])
-        if max_pairs_per_pred_len > 0:
-            seen_pl: set[int] = set()
-            filtered: list[tuple[str, int, int, dict[str, Any], dict[str, Any], float]] = []
-            for item in tc_items:
-                pl = item[1]
-                if pl in seen_pl:
-                    continue
-                seen_pl.add(pl)
-                filtered.append(item)
-                if len(seen_pl) >= max_pairs_per_pred_len:
-                    break
-            tc_items = filtered if filtered else tc_items[:max_pairs_per_toolchain]
-        selected.extend(tc_items[: max(1, max_pairs_per_toolchain)])
-
-    selected = sorted(selected, key=lambda x: -x[5])[: max(1, max_total_pairs)]
-    return [(a, b, c, d, e) for a, b, c, d, e, _ in selected]
-
-
-def iter_contrast_pairs(
-    rows: list[dict[str, Any]],
-    dataset_names: list[str],
-    threshold_quantile: float = 0.5,
-    max_total_pairs: int = 10,
-    max_pairs_per_toolchain: int = 2,
-    max_pairs_per_pred_len: int = 1,
-) -> list[tuple[str, int, int, dict[str, Any], dict[str, Any]]]:
-    return select_contrast_pairs(
-        rows,
-        dataset_names,
-        threshold_quantile,
-        max_total_pairs=max_total_pairs,
-        max_pairs_per_toolchain=max_pairs_per_toolchain,
-        max_pairs_per_pred_len=max_pairs_per_pred_len,
-    )
 
 
 def _all_contrast_groups(
@@ -261,12 +169,79 @@ def select_contrast_strategy_groups(
     max_total_groups: int = 10,
     **_: Any,
 ) -> list[tuple[str, list[dict[str, Any]], list[dict[str, Any]]]]:
-    """One contrast per toolchain (paper § contrastive pairs on fixed strategy a)."""
+    """One contrast per toolchain (paper: fixed strategy a with nonempty C+/C-).
+
+    Budgeting is a fuzzy-area engineering choice. Pure gap-ranking tends to keep
+    only high-variance / deep-preprocess variants and starve shallow baselines in
+    the same forecast-model family. Select by round-robin across forecast families,
+    preferring shallow preprocessing depth then larger mean reward gap within each
+    family (no dataset- or toolchain-name hardcoding).
+    """
     raw = _all_contrast_groups_by_strategy(rows, dataset_names, threshold_quantile)
     if not raw:
         return []
-    selected = sorted(raw, key=lambda x: -x[3])[: max(1, max_total_groups)]
-    return [(tc, pos, neg) for tc, pos, neg, _ in selected]
+    budget = max(1, int(max_total_groups))
+    return _select_strategy_groups_family_diverse(raw, budget)
+
+
+def _select_strategy_groups_family_diverse(
+    raw: list[tuple[str, list[dict[str, Any]], list[dict[str, Any]], float]],
+    budget: int,
+) -> list[tuple[str, list[dict[str, Any]], list[dict[str, Any]]]]:
+    """Round-robin across forecasting families; shallow-then-gap within family."""
+    by_family: dict[str, list[tuple[str, list[dict[str, Any]], list[dict[str, Any]], float]]] = {}
+    for item in raw:
+        family = forecasting_model_from_arm(item[0])
+        by_family.setdefault(family, []).append(item)
+    for family, items in by_family.items():
+        items.sort(
+            key=lambda x: (
+                preprocessing_depth_from_arm(x[0]),
+                -x[3],
+                x[0],
+            )
+        )
+
+    # Stable family order: families that contain a shallow (depth-0) arm first,
+    # then by their best gap (so strong contrasts still get early slots).
+    def family_key(fam: str) -> tuple[int, float, str]:
+        items = by_family[fam]
+        min_depth = min(preprocessing_depth_from_arm(tc) for tc, *_ in items)
+        best_gap = max(gap for *_, gap in items)
+        return (min_depth, -best_gap, fam)
+
+    families = sorted(by_family.keys(), key=family_key)
+    selected: list[tuple[str, list[dict[str, Any]], list[dict[str, Any]]]] = []
+    seen: set[str] = set()
+    idx = 0
+    while len(selected) < budget:
+        progressed = False
+        for fam in families:
+            items = by_family[fam]
+            if idx >= len(items):
+                continue
+            tc, pos, neg, _gap = items[idx]
+            if tc in seen:
+                continue
+            selected.append((tc, pos, neg))
+            seen.add(tc)
+            progressed = True
+            if len(selected) >= budget:
+                break
+        if not progressed:
+            break
+        idx += 1
+
+    if len(selected) < budget:
+        remainder = sorted(raw, key=lambda x: -x[3])
+        for tc, pos, neg, _gap in remainder:
+            if tc in seen:
+                continue
+            selected.append((tc, pos, neg))
+            seen.add(tc)
+            if len(selected) >= budget:
+                break
+    return selected
 
 
 def iter_contrast_strategy_groups(
@@ -354,51 +329,6 @@ def build_induction_prompts(
         out.write_text(prompt)
         paths.append(out)
     return paths
-
-
-def heuristic_induce_lessons(
-    results_csv: Path,
-    dataset_names: list[str],
-    threshold_quantile: float = 0.5,
-) -> list[Lesson]:
-    rows = load_result_rows(results_csv)
-    meta = dataset_meta_map(dataset_names)
-    lessons: list[Lesson] = []
-    categorical = ["seasonality_level", "trend_level", "volatility_level", "stationarity_label", "missing_pattern"]
-
-    for toolchain in sorted({row["toolchain"] for row in rows}):
-        subset = [row for row in rows if row["toolchain"] == toolchain and row["dataset"] in meta]
-        if len(subset) < 2:
-            continue
-        rewards = np.array([row["reward"] for row in subset], dtype=float)
-        threshold = float(np.quantile(rewards, threshold_quantile))
-        pos = [row for row in subset if row["reward"] >= threshold]
-        neg = [row for row in subset if row["reward"] < threshold]
-        if not pos or not neg:
-            continue
-        conditions = _contrastive_conditions(pos, neg, meta, categorical)
-        if not conditions:
-            continue
-        lesson = Lesson(
-            lesson_id=f"induced_{toolchain}_{len(lessons) + 1}",
-            lesson_type="positive",
-            toolchain=toolchain,
-            task_category="Forecasting",
-            activation_conditions=conditions,
-            phenomenon=(
-                f"[Phenomenon]: The six-stage toolchain {toolchain} belongs to the long-term Forecasting strategy "
-                f"space. In the sampled runs, this composition ranked better when {conditions} held than under the "
-                f"contrasted negative cases."
-            ),
-            analysis=(
-                "[Analysis]: This is an automatically induced candidate lesson from contrastive BECRA evidence. "
-                "It must be verified by controlled policy intervention or at least held-out result filtering before use."
-            ),
-            confidence=0.5,
-            tags=["induced", "requires_verification"],
-        )
-        lessons.append(lesson)
-    return lessons
 
 
 _COMPACT_META_KEYS = (
@@ -664,17 +594,6 @@ def dedupe_lessons_with_report(lessons: list[Lesson]) -> tuple[list[Lesson], lis
 PlanFn = Callable[[dict[str, Any], list[Lesson]], "str | None"]
 
 
-def verify_rule_plan_fn(meta: dict[str, Any], lessons: list[Lesson]) -> str:
-    """Alg. 3 rule fallback: toolchain-scoped votes (induced lessons carry evidence toolchain)."""
-    return _pick_by_lesson_votes(
-        meta,
-        lessons,
-        set(TOOLCHAINS.keys()),
-        note="verify_rule",
-        toolchain_scope=True,
-    ).toolchain.name
-
-
 def _default_plan_fn(meta: dict[str, Any], lessons: list[Lesson]) -> str:
     return plan_toolchain(meta, lessons=lessons, skip_meta_filter=True).toolchain.name
 
@@ -695,16 +614,17 @@ def _verify_lesson_pools(
 ) -> tuple[list[Lesson], list[Lesson]]:
     """Build treat/control lesson pools for paired verification.
 
-    paper (Alg. 3): plan with library L vs L \\ {phi_k}.
+    paper / original (Alg. 3): plan with library L vs L \\ {phi_k}.
     pool_scope=all uses all candidates; toolchain restricts L to the candidate's toolchain.
+    focused (legacy): only the candidate lesson vs empty pool.
     """
-    if verify_mode == "paper":
+    if verify_mode in ("paper", "original"):
         candidates = list(all_candidates or [])
         if pool_scope == "toolchain":
             candidates = _scoped_verify_candidates(lesson, candidates)
         full_l = merge_lesson_collections(background, candidates)
         pool_with = list(full_l)
-        pool_without = [item for item in full_l if item.lesson_id != lesson.lesson_id]
+        pool_without = [l for l in full_l if l.lesson_id != lesson.lesson_id]
         return pool_with, pool_without
     return [lesson], []
 
@@ -813,13 +733,6 @@ def _success_top_alpha_from_rewards(rewards: list[float], reward: float, top_alp
     return 1.0 if reward >= threshold else 0.0
 
 
-def _success_paired_reward(treat_reward: float | None, ctrl_reward: float | None) -> float | None:
-    """Direct paired success: treat toolchain beats control on the same (dataset, pred_len)."""
-    if treat_reward is None or ctrl_reward is None:
-        return None
-    return 1.0 if treat_reward > ctrl_reward else 0.0
-
-
 def _select_verify_episodes(
     lesson: Lesson,
     meta: dict[str, dict[str, Any]],
@@ -848,180 +761,6 @@ def _select_verify_episodes(
         scored.append((dataset,))
     scored.sort(key=lambda item: item[0])
     return [(dataset, pred_len) for (dataset,) in scored[:target_datasets]]
-
-
-def verify_lessons_paired_intervention(
-    candidate_lessons: list[Lesson],
-    results_csv: Path,
-    dataset_names: list[str],
-    candidate_pool: list[Lesson] | None = None,
-    top_alpha: float = 0.35,
-    min_effect: float = 0.0,
-    min_verify_support: int = 2,
-    target_verify_datasets: int = 4,
-    plan_fn: PlanFn | None = None,
-    *,
-    verify_mode: str = "paper",
-    success_metric: str = "top_alpha",
-    all_candidates: list[Lesson] | None = None,
-    verify_planning_top_k: int = 8,
-    verify_pool_scope: str = "all",
-    skip_identical_plans: bool = True,
-) -> list[dict[str, Any]]:
-    """Paper Stage 3 (Alg. 3): paired controlled intervention on the planner.
-
-    For each candidate lesson phi_k:
-      * positive lesson: compare planning with vs. without phi_k in the lesson pool.
-      * negative lesson: compare following phi_k (planner avoids the warned toolchain) versus the
-        Contradict(phi_k) intervention that forces the warned toolchain.
-
-    Outcomes y in {0,1} are evaluated by looking up whether the chosen toolchain's reward falls
-    inside the top-alpha quantile of all toolchains observed on the same (dataset, pred_len).
-    Lessons whose Delta_{phi_k} exceeds min_effect are returned with verification metadata.
-    """
-    rows = load_result_rows(results_csv)
-    if not rows:
-        return []
-    meta = dataset_meta_map(dataset_names)
-    rows_by_key = _group_rows(rows)
-    pred_lens = sorted({row["pred_len"] for row in rows})
-
-    background: list[Lesson] = list(candidate_pool) if candidate_pool is not None else []
-    planner = plan_fn or _default_plan_fn
-
-    verified: list[dict[str, Any]] = []
-    skipped_no_match = 0
-    skipped_no_episodes = 0
-    for lesson in candidate_lessons:
-        eligible = [d for d in dataset_names if d in meta]
-        episode_keys = _select_verify_episodes(
-            lesson,
-            meta,
-            eligible,
-            pred_lens,
-            target_datasets=target_verify_datasets,
-        )
-        if not episode_keys:
-            skipped_no_match += 1
-            continue
-        pool_with, pool_without = _verify_lesson_pools(
-            lesson,
-            background,
-            verify_mode,
-            all_candidates=all_candidates or candidate_lessons,
-            pool_scope=verify_pool_scope,
-        )
-
-        y_treat: list[float] = []  # corresponds to P(y=1 | f_k, phi_k)
-        y_ctrl: list[float] = []   # corresponds to P(y=1 | f_k, not phi_k) or Contradict(phi_k)
-        episodes: list[dict[str, Any]] = []
-        skipped_identical = 0
-
-        for dataset, pred_len in episode_keys:
-            key = (dataset, int(pred_len))
-            if key not in rows_by_key:
-                continue
-            observed = rows_by_key[key]
-            meta_pl = meta[dataset]
-            if lesson.lesson_type == "negative":
-                a_treat = _plan_verify_episode(
-                    planner,
-                    meta_pl,
-                    pred_len,
-                    pool_with,
-                    force_include=lesson,
-                    top_k=verify_planning_top_k,
-                )
-                a_ctrl = _contradict_toolchain(lesson)
-            else:
-                a_treat = _plan_verify_episode(
-                    planner,
-                    meta_pl,
-                    pred_len,
-                    pool_with,
-                    force_include=lesson,
-                    top_k=verify_planning_top_k,
-                )
-                a_ctrl = _plan_verify_episode(
-                    planner,
-                    meta_pl,
-                    pred_len,
-                    pool_without,
-                    top_k=verify_planning_top_k,
-                )
-            if a_treat is None or a_ctrl is None:
-                continue
-
-            rt = next((float(r["reward"]) for r in observed if r["toolchain"] == a_treat), None)
-            rc = next((float(r["reward"]) for r in observed if r["toolchain"] == a_ctrl), None)
-            pool_rewards = [float(r["reward"]) for r in observed]
-            resolved = _resolve_episode_success(
-                success_metric,
-                a_treat,
-                a_ctrl,
-                rt,
-                rc,
-                pool_rewards,
-                top_alpha,
-                skip_identical_plans=skip_identical_plans,
-            )
-            if resolved is None:
-                if skip_identical_plans and a_treat == a_ctrl:
-                    skipped_identical += 1
-                continue
-            y_t, y_c = resolved
-            y_treat.append(y_t)
-            y_ctrl.append(y_c)
-            episodes.append({
-                "dataset": dataset,
-                "pred_len": int(pred_len),
-                "a_treat": a_treat,
-                "a_ctrl": a_ctrl,
-                "y_treat": y_t,
-                "y_ctrl": y_c,
-            })
-
-        if not y_treat:
-            skipped_no_episodes += 1
-            if skipped_identical:
-                print(
-                    f"[verify] skip lesson={lesson.lesson_id}: no informative episodes "
-                    f"(identical_plans={skipped_identical})"
-                )
-            continue
-        effect = float(np.mean(y_treat) - np.mean(y_ctrl))
-        pass_support = min(min_verify_support, len(y_treat))
-        passed = effect > min_effect and len(y_treat) >= pass_support
-        item = lesson.to_dict()
-        item.update({
-            "verification_mode": "paired_intervention",
-            "verify_mode": verify_mode,
-            "success_metric": success_metric,
-            "verification_effect": effect,
-            "p_treat": float(np.mean(y_treat)),
-            "p_ctrl": float(np.mean(y_ctrl)),
-            "verification_support": len(y_treat),
-            "verification_episodes": episodes,
-            "verified": passed,
-            "control_kind": (
-                "contradict"
-                if lesson.lesson_type == "negative"
-                else ("empty_pool" if verify_mode == "focused" else "without_lesson")
-            ),
-        })
-        status = "PASS" if item["verified"] else "fail"
-        print(
-            f"[verify] {status} lesson={lesson.lesson_id} effect={effect:.3f} "
-            f"support={len(y_treat)}/{len(episode_keys)} mode={verify_mode} metric={success_metric}"
-        )
-        if item["verified"]:
-            verified.append(item)
-    print(
-        f"[verify] summary mode={verify_mode} metric={success_metric} "
-        f"candidates={len(candidate_lessons)} verified={len(verified)} "
-        f"skipped_no_activation_match={skipped_no_match} skipped_no_episodes={skipped_no_episodes}"
-    )
-    return verified
 
 
 def verify_lessons_real_paired_rollout(
@@ -1276,78 +1015,8 @@ def verify_lessons_real_paired_rollout(
     return verified
 
 
-def verify_lessons_from_results(
-    lessons: list[Lesson],
-    results_csv: Path,
-    dataset_names: list[str],
-    top_alpha: float = 0.35,
-    min_effect: float = 0.0,
-) -> list[dict[str, Any]]:
-    rows = load_result_rows(results_csv)
-    meta = dataset_meta_map(dataset_names)
-    by_dataset: dict[str, list[dict[str, Any]]] = {}
-    for row in rows:
-        by_dataset.setdefault(row["dataset"], []).append(row)
-
-    verified: list[dict[str, Any]] = []
-    for lesson in lessons:
-        successes = []
-        baseline = []
-        for dataset, dataset_rows in by_dataset.items():
-            if dataset not in meta or not condition_matches(meta[dataset], lesson.activation_conditions):
-                continue
-            ranked = sorted(dataset_rows, key=lambda item: item["reward"], reverse=True)
-            cutoff = max(1, int(np.ceil(len(ranked) * top_alpha)))
-            top_toolchains = {row["toolchain"] for row in ranked[:cutoff]}
-            match_names = _lesson_toolchain_names(lesson)
-            successes.append(1.0 if match_names & top_toolchains else 0.0)
-            baseline.append(cutoff / max(1, len(ranked)))
-        if not successes:
-            continue
-        effect = float(np.mean(successes) - np.mean(baseline))
-        item = lesson.to_dict()
-        item["verification_effect"] = effect
-        item["verification_support"] = len(successes)
-        item["verified"] = effect > min_effect
-        if item["verified"]:
-            verified.append(item)
-    return verified
-
-
 def _score_dict(row: dict[str, Any]) -> dict[str, Any]:
     return {"dataset": row["dataset"], "pred_len": row["pred_len"], "mse": row["mse"], "mae": row["mae"], "reward": row["reward"]}
-
-
-def _meta_with_result(meta: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
-    item = dict(meta)
-    item.update(_score_dict(row))
-    return item
-
-
-def _contrastive_conditions(
-    pos: list[dict[str, Any]],
-    neg: list[dict[str, Any]],
-    meta: dict[str, dict[str, Any]],
-    categorical: list[str],
-) -> dict[str, Any]:
-    conditions: dict[str, Any] = {}
-    for key in categorical:
-        pos_values = [meta[row["dataset"]].get(key) for row in pos]
-        neg_values = [meta[row["dataset"]].get(key) for row in neg]
-        mode = _mode(pos_values)
-        if mode is not None and mode not in set(neg_values):
-            conditions[key] = [mode]
-    numeric_keys = ["num_variates", "missing_rate", "seasonality_strength", "coefficient_of_variation", "anomaly_ratio"]
-    for key in numeric_keys:
-        pos_vals = np.array([meta[row["dataset"]].get(key) for row in pos if meta[row["dataset"]].get(key) is not None], dtype=float)
-        neg_vals = np.array([meta[row["dataset"]].get(key) for row in neg if meta[row["dataset"]].get(key) is not None], dtype=float)
-        if pos_vals.size == 0 or neg_vals.size == 0:
-            continue
-        if np.median(pos_vals) > np.median(neg_vals) * 1.5 + 1e-8:
-            conditions[key] = f">={float(np.median(pos_vals)):.4g}"
-        elif np.median(pos_vals) * 1.5 + 1e-8 < np.median(neg_vals):
-            conditions[key] = f"<={float(np.median(pos_vals)):.4g}"
-    return conditions
 
 
 def _mode(values: list[Any]) -> Any:
@@ -1364,18 +1033,6 @@ def _group_rows(rows: list[dict[str, Any]]) -> dict[tuple[str, int], list[dict[s
     for row in rows:
         grouped.setdefault((row["dataset"], int(row["pred_len"])), []).append(row)
     return grouped
-
-
-def _success_top_alpha(toolchain: str, observed: list[dict[str, Any]], top_alpha: float) -> float | None:
-    match = next((row for row in observed if row["toolchain"] == toolchain), None)
-    if match is None:
-        return None
-    rewards = sorted((row["reward"] for row in observed), reverse=True)
-    if not rewards:
-        return None
-    cutoff = max(1, int(math.ceil(len(rewards) * top_alpha)))
-    threshold = rewards[cutoff - 1]
-    return 1.0 if match["reward"] >= threshold else 0.0
 
 
 def _compact_meta(meta: dict[str, Any]) -> dict[str, Any]:

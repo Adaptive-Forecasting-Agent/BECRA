@@ -4,6 +4,7 @@
 #
 # Usage:
 #   ./scripts/run_all_holdouts_sequential.sh
+#   ./scripts/run_all_holdouts_sequential.sh --nohup
 #   ./scripts/run_all_holdouts_sequential.sh --from electricity
 #   ./scripts/run_all_holdouts_sequential.sh --only ettm2
 set -euo pipefail

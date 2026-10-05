@@ -140,22 +140,3 @@ def is_valid_lesson_tool(tool: str, task_category: str, stages: dict[str, str]) 
     return canon.lower() == have.lower()
 
 
-def active_stage_tools(stages: dict[str, str]) -> list[tuple[str, str, str]]:
-    """(stage_key, task_category, tool) for each non-trivial stage on a toolchain."""
-    mapping = [
-        ("imputation", "Imputation"),
-        ("anomaly_handling", "Anomaly Handling"),
-        ("transformation", "Transformation"),
-        ("decomposition", "Decomposition"),
-        ("normalization", "Normalization"),
-        ("forecasting", "Forecasting"),
-    ]
-    out: list[tuple[str, str, str]] = []
-    for stage_key, category in mapping:
-        tool = normalize_tool_name(stages.get(stage_key, ""))
-        if not tool:
-            continue
-        if stage_key in ("transformation",) and tool == "none":
-            continue
-        out.append((stage_key, category, tool))
-    return out
