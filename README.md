@@ -20,7 +20,7 @@ BECRA is an agent training paradigm for adaptive time-series forecasting. Instea
 Real-world time series are heterogeneous: they differ in volatility, seasonality, missingness, anomaly patterns, cross-variate structure, and distribution shift. No single forecasting model or preprocessing chain is universally optimal. BECRA treats forecasting as an **agent decision problem**: given dataset meta-features, the agent composes a multi-stage toolchain across imputation, anomaly handling, transformation, decomposition, normalization, and forecasting, while accumulating transferable knowledge that can be verified, stored, retrieved, and reused at deployment time.
 
 <p align="center">
-  <img src="asset/framework_overview.png" alt="BECRA framework overview" width="92%">
+  <img src="asset/framework_overview.jpg" alt="BECRA framework overview" width="92%">
   <br>
   <em>Overview of the four-stage BECRA training and adaptation cycle.</em>
 </p>
